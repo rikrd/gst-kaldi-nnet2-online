@@ -49,6 +49,7 @@
 
 #include "fstext/fstext-lib.h"
 #include "lat/confidence.h"
+#include "hmm/hmm-utils.h"
 #include <fst/script/project.h>
 
 namespace kaldi {
@@ -60,6 +61,8 @@ GST_DEBUG_CATEGORY_STATIC(gst_kaldinnet2onlinedecoder_debug);
 enum {
   PARTIAL_RESULT_SIGNAL,
   FINAL_RESULT_SIGNAL,
+  PARTIAL_PHONE_ALIGNMENT_SIGNAL,
+  FINAL_PHONE_ALIGNMENT_SIGNAL,
   LAST_SIGNAL
 };
 
@@ -69,6 +72,8 @@ enum {
   PROP_MODEL,
   PROP_FST,
   PROP_WORD_SYMS,
+  PROP_PHONE_SYMS,
+  PROP_DO_PHONE_ALIGNMENT,
   PROP_DO_ENDPOINTING,
   PROP_ADAPTATION_STATE,
   PROP_INVERSE_SCALE,
@@ -83,6 +88,7 @@ enum {
 #define DEFAULT_MODEL           "final.mdl"
 #define DEFAULT_FST             "HCLG.fst"
 #define DEFAULT_WORD_SYMS       "words.txt"
+#define DEFAULT_PHONE_SYMS       ""
 #define DEFAULT_LMWT_SCALE	1.0
 #define DEFAULT_CHUNK_LENGTH_IN_SECS  0.05
 #define DEAFULT_USE_THREADED_DECODER false
@@ -180,6 +186,23 @@ static void gst_kaldinnet2onlinedecoder_class_init(
                           (GParamFlags) G_PARAM_READWRITE));
   g_object_class_install_property(
       gobject_class,
+      PROP_PHONE_SYMS,
+      g_param_spec_string("phone-syms", "Phoneme symbols",
+                          "Name of phoneme symbols file (typically phones.txt)",
+                          DEFAULT_PHONE_SYMS,
+                          (GParamFlags) G_PARAM_READWRITE));
+
+  g_object_class_install_property(
+      gobject_class,
+      PROP_DO_PHONE_ALIGNMENT,
+      g_param_spec_boolean(
+          "do-phone-alignment", "Phoneme-level alignment",
+          "If true, output phoneme-level alignment",
+          FALSE,
+          (GParamFlags) G_PARAM_READWRITE));
+
+  g_object_class_install_property(
+      gobject_class,
       PROP_DO_ENDPOINTING,
       g_param_spec_boolean(
           "do-endpointing", "If true, apply endpoint detection",
@@ -267,6 +290,20 @@ static void gst_kaldinnet2onlinedecoder_class_init(
       NULL, kaldi_marshal_VOID__STRING, G_TYPE_NONE, 1,
       G_TYPE_STRING);
 
+  gst_kaldinnet2onlinedecoder_signals[FINAL_PHONE_ALIGNMENT_SIGNAL] = g_signal_new(
+      "final-phone-alignment", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
+      G_STRUCT_OFFSET(Gstkaldinnet2onlinedecoderClass, final_phone_alignment),
+      NULL,
+      NULL, kaldi_marshal_VOID__STRING, G_TYPE_NONE, 1,
+      G_TYPE_STRING);
+
+  gst_kaldinnet2onlinedecoder_signals[PARTIAL_PHONE_ALIGNMENT_SIGNAL] = g_signal_new(
+      "partial-phone-alignment", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST,
+      G_STRUCT_OFFSET(Gstkaldinnet2onlinedecoderClass, partial_phone_alignment),
+      NULL,
+      NULL, kaldi_marshal_VOID__STRING, G_TYPE_NONE, 1,
+      G_TYPE_STRING);
+
   gst_element_class_set_details_simple(
       gstelement_class, "KaldiNNet2OnlineDecoder", "Speech/Audio",
       "Convert speech to text", "Tanel Alumae <tanel.alumae@phon.ioc.ee>");
@@ -313,6 +350,9 @@ static void gst_kaldinnet2onlinedecoder_init(
   filter->model_rspecifier = g_strdup(DEFAULT_MODEL);
   filter->fst_rspecifier = g_strdup(DEFAULT_FST);
   filter->word_syms_filename = g_strdup(DEFAULT_WORD_SYMS);
+  filter->phone_syms_filename = g_strdup(DEFAULT_PHONE_SYMS);
+
+  filter->do_phone_alignment = false;
 
   filter->simple_options = new SimpleOptionsGst();
 
@@ -450,6 +490,13 @@ static void gst_kaldinnet2onlinedecoder_set_property(GObject * object,
       g_free(filter->word_syms_filename);
       filter->word_syms_filename = g_value_dup_string(value);
       break;
+    case PROP_PHONE_SYMS:
+      g_free(filter->phone_syms_filename);
+      filter->phone_syms_filename = g_value_dup_string(value);
+      break;
+    case PROP_DO_PHONE_ALIGNMENT:
+      filter->do_phone_alignment = g_value_get_boolean(value);
+      break;
     case PROP_DO_ENDPOINTING:
       filter->do_endpointing = g_value_get_boolean(value);
       break;
@@ -571,6 +618,12 @@ static void gst_kaldinnet2onlinedecoder_get_property(GObject * object,
     case PROP_WORD_SYMS:
       g_value_set_string(value, filter->word_syms_filename);
       break;
+    case PROP_PHONE_SYMS:
+      g_value_set_string(value, filter->phone_syms_filename);
+      break;
+    case PROP_DO_PHONE_ALIGNMENT:
+      g_value_set_boolean(value, filter->do_phone_alignment);
+      break;
     case PROP_DO_ENDPOINTING:
       g_value_set_boolean(value, filter->do_endpointing);
       break;
@@ -602,6 +655,7 @@ static void gst_kaldinnet2onlinedecoder_get_property(GObject * object,
           g_value_set_string(value, "");
       }
       break;
+
     default:
       if (prop_id >= PROP_LAST) {
         const gchar* name = g_param_spec_get_name(pspec);
@@ -699,6 +753,43 @@ static void gst_kaldinnet2onlinedecoder_final_result(
   guint hyp_length = sentence.str().length();
   *num_words = hyp_length;
   if (hyp_length > 0) {
+    if (filter->do_phone_alignment) {
+        if (strcmp(filter->phone_syms_filename, "")) {
+            GST_ERROR_OBJECT(filter, "Phoneme symbol table filename (phone-syms-filename) must be set to do phone alignment.");
+        } else {
+            // Output the alignment with the weights
+            std::vector<std::vector<int32> > split;
+            SplitToPhones(*filter->trans_model, alignment, &split);
+
+            BaseFloat frame_shift = filter->feature_info->FrameShiftInSeconds();
+            std::vector<std::pair<int32, BaseFloat> > pairs;
+            std::stringstream phone_alignment;
+
+            for (size_t i = 0; i < split.size(); i++) {
+              KALDI_ASSERT(split[i].size() > 0);
+              int32 phone = filter->trans_model->TransitionIdToPhone(split[i][0]);
+              std::string s = filter->phone_syms->Find(phone);
+              if (s == "")
+                GST_ERROR_OBJECT(filter, "Word-id %d not in symbol table.", words[i]);
+
+              int32 num_repeats = split[i].size();
+
+              phone_alignment << s << " " << num_repeats*frame_shift << std::endl;
+
+              pairs.push_back(std::make_pair(phone, num_repeats*frame_shift));
+            }
+
+            guint pali_length = phone_alignment.str().length();
+            GstBuffer *pali_buffer = gst_buffer_new_and_alloc(pali_length + 1);
+            gst_buffer_fill(pali_buffer, 0, phone_alignment.str().c_str(), pali_length);
+            gst_buffer_memset(pali_buffer, pali_length, '\n', 1);
+            gst_pad_push(filter->srcpad, pali_buffer);
+
+            /* Emit a signal for applications. */
+            g_signal_emit(filter, gst_kaldinnet2onlinedecoder_signals[FINAL_PHONE_ALIGNMENT_SIGNAL], 0, phone_alignment.str().c_str());
+        }
+    }
+
     GstBuffer *buffer = gst_buffer_new_and_alloc(hyp_length + 1);
     gst_buffer_fill(buffer, 0, sentence.str().c_str(), hyp_length);
     gst_buffer_memset(buffer, hyp_length, '\n', 1);
@@ -1105,6 +1196,15 @@ gst_kaldinnet2onlinedecoder_allocate(
       return false;
     }
 
+    if (!strcmp(filter->phone_syms_filename, "")) {
+      if (!(filter->phone_syms = fst::SymbolTable::ReadText(
+        filter->phone_syms_filename))) {
+        GST_ERROR_OBJECT(filter, "Could not read symbol table from file %s",
+                         filter->phone_syms_filename);
+        return false;
+      }
+    }
+
     filter->adaptation_state = new OnlineIvectorExtractorAdaptationState(
         filter->feature_info->ivector_extractor_info);
 
@@ -1205,6 +1305,7 @@ static void gst_kaldinnet2onlinedecoder_finalize(GObject * object) {
   g_free(filter->model_rspecifier);
   g_free(filter->fst_rspecifier);
   g_free(filter->word_syms_filename);
+  g_free(filter->phone_syms_filename);
   delete filter->endpoint_config;
   delete filter->feature_config;
   delete filter->nnet2_decoding_config;
@@ -1238,7 +1339,6 @@ static void gst_kaldinnet2onlinedecoder_finalize(GObject * object) {
   if (filter->lm_compose_cache) {
     delete filter->lm_compose_cache;
   }
-
 
   G_OBJECT_CLASS(parent_class)->finalize(object);
 }
