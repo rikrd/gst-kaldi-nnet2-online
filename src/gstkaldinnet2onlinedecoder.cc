@@ -756,6 +756,8 @@ static void gst_kaldinnet2onlinedecoder_final_result(
     if (filter->do_phone_alignment) {
         if (strcmp(filter->phone_syms_filename, "") == 0) {
             GST_ERROR_OBJECT(filter, "Phoneme symbol table filename (phone-syms) must be set to do phone alignment.");
+        } else if (filter->phone_syms == NULL) {
+            GST_ERROR_OBJECT(filter, "Phoneme symbol table wasn't loaded correctly. Not performing alignment.");
         } else {
             GST_DEBUG_OBJECT(filter, "Phoneme alignment...");
 
