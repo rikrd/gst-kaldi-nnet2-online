@@ -754,23 +754,28 @@ static void gst_kaldinnet2onlinedecoder_final_result(
   *num_words = hyp_length;
   if (hyp_length > 0) {
     if (filter->do_phone_alignment) {
-        if (strcmp(filter->phone_syms_filename, "")) {
-            GST_ERROR_OBJECT(filter, "Phoneme symbol table filename (phone-syms-filename) must be set to do phone alignment.");
+        if (strcmp(filter->phone_syms_filename, "") == 0) {
+            GST_ERROR_OBJECT(filter, "Phoneme symbol table filename (phone-syms) must be set to do phone alignment.");
         } else {
+            GST_DEBUG_OBJECT(filter, "Phoneme alignment...");
+
             // Output the alignment with the weights
             std::vector<std::vector<int32> > split;
             SplitToPhones(*filter->trans_model, alignment, &split);
+
+            GST_DEBUG_OBJECT(filter, "Split to phones finished");
 
             BaseFloat frame_shift = filter->feature_info->FrameShiftInSeconds();
             std::vector<std::pair<int32, BaseFloat> > pairs;
             std::stringstream phone_alignment;
 
             for (size_t i = 0; i < split.size(); i++) {
+              GST_DEBUG_OBJECT(filter, "Iterating over splits split[%u].size() == %u", i, split[i].size());
               KALDI_ASSERT(split[i].size() > 0);
               int32 phone = filter->trans_model->TransitionIdToPhone(split[i][0]);
               std::string s = filter->phone_syms->Find(phone);
               if (s == "")
-                GST_ERROR_OBJECT(filter, "Word-id %d not in symbol table.", words[i]);
+                GST_ERROR_OBJECT(filter, "Phoneme-id %d not in symbol table.", phone);
 
               int32 num_repeats = split[i].size();
 
@@ -1196,7 +1201,7 @@ gst_kaldinnet2onlinedecoder_allocate(
       return false;
     }
 
-    if (!strcmp(filter->phone_syms_filename, "")) {
+    if (strcmp(filter->phone_syms_filename, "") != 0) {
       if (!(filter->phone_syms = fst::SymbolTable::ReadText(
         filter->phone_syms_filename))) {
         GST_ERROR_OBJECT(filter, "Could not read symbol table from file %s",
